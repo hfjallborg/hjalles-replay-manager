@@ -1,16 +1,17 @@
 import datetime
+import glob
 import os
 import pathlib
 import shutil
-import threading
 import subprocess
-import glob
+import threading
+
+import ffmpeg
 
 import obspython as obs
-
 import psutil
 
-__version__ = "1.1.0-alpha.1"
+__version__ = "1.2.0-alpha.2"
 
 CURRENT_BUFFER = {
     "start_time": None,
@@ -19,15 +20,7 @@ CURRENT_BUFFER = {
 
 
 def script_description():
-    return f"<b>Hjalles Replay Manager</b> v. {__version__}" + \
-           "<hr>" + \
-           "Adds tools to manage your replay buffer files beyond what OBS normally offers, such as" + \
-           "<ul>" + \
-           "<li>setting a dedicated replay directory, to separate them from regular recordings.</li>" + \
-           "<li>keeping a static path to the latest replay, without overwriting previous ones.</li>" + \
-           "<li>organizing replay files in a customizable folder structure.</li>" + \
-           "</ul>" + \
-           "<hr>"
+    return f"<b>Hjalles Replay Manager</b> v. {__version__}"
 
 
 def script_load(settings):
@@ -66,6 +59,10 @@ def script_load(settings):
                                                               "BF2042.exe, Battlefield 2042, BF2042\n"
                                                               "bfv.exe, Battlefield V, BF5"))
 
+    obs.obs_data_set_default_bool(settings, "ConcatenateReplays", False)
+
+    obs.obs_data_set_default_string(settings, "RemuxFilenameFormat", "%FILE%_remux")
+
     script_update(settings)
 
 
@@ -81,6 +78,8 @@ def script_update(settings):
 
     SETTINGS["PersistentReplayFile"] = obs.obs_data_get_bool(settings, "PersistentReplayFile")
 
+    SETTINGS["ConcatenateReplays"] = obs.obs_data_get_bool(settings, "ConcatenateReplays")
+
     SETTINGS["SortReplays"] = obs.obs_data_get_bool(settings, "SortReplays")
     SETTINGS["SortByDate"] = obs.obs_data_get_bool(settings, "SortByDate")
     SETTINGS["DatetimeSortScheme"] = obs.obs_data_get_string(settings, "DatetimeSortScheme")
@@ -92,6 +91,7 @@ def script_update(settings):
     SETTINGS["ExeSortList"] = obs.obs_data_get_string(settings, "ExeSortList")
 
     SETTINGS["RemuxReplays"] = obs.obs_data_get_bool(settings, "RemuxReplays")
+    SETTINGS["RemuxOnBufferStop"] = obs.obs_data_get_bool(settings, "RemuxOnBufferStop")
     SETTINGS["RemuxMode"] = obs.obs_data_get_string(settings, "RemuxMode")
     SETTINGS["RemuxFilenameFormat"] = obs.obs_data_get_string(settings, "RemuxFilenameFormat")
     SETTINGS["RemuxVEncoder"] = obs.obs_data_get_string(settings, "RemuxVEncoder")
@@ -131,7 +131,6 @@ def file_sorting_modified(props, prop, settings, *args, **kwargs):
     else:
         obs.obs_property_set_visible(datetime_sort_base, False)
         obs.obs_property_set_visible(datetime_sort_scheme, False)
-
 
     return True  # VERY IMPORTANT
 
@@ -292,43 +291,130 @@ def generate_ffmpeg_cmd(input_path):
     return ffmpeg_cmd
 
 
-def run_ffmpeg(ffmpeg_cmd):
-    p = subprocess.run(ffmpeg_cmd, shell=True)
-    return
+def generate_ffmpeg_object(input_path):
+    global SETTINGS
+
+    input_file = pathlib.Path(input_path)
+    filename_format = SETTINGS["RemuxFilenameFormat"]
+    stem = filename_format.replace("%FILE%", input_file.stem)
+    container = SETTINGS["RemuxFileContainer"]
+    output_filename = f"{stem}.{container}"
+    output_path = os.path.join(input_file.parent, output_filename)
+
+    ffmpeg_input = ffmpeg.input(input_path)
+
+    audio = ffmpeg_input.audio
+    video = ffmpeg_input.video
+
+    if SETTINGS["RemuxMode"] == "standard":
+        v_encoder = SETTINGS["RemuxVEncoder"]
+
+        if v_encoder == "copy":
+            ffmpeg_cmd = ffmpeg.output(audio, video, output_path,
+                                       vcodec="copy",
+                                       acodec="copy",
+                                       map="-map 0")
+
+        elif v_encoder == "libx264":
+            crf = SETTINGS["RemuxCRF"]
+            preset = SETTINGS["RemuxH264Preset"]
+            ffmpeg_cmd = ffmpeg.output(audio, video, output_path,
+                                       vcodec="libx264",
+                                       acodec="copy",
+                                       map="-map 0",
+                                       preset=preset,
+                                       crf=crf)
+
+        elif v_encoder == "h264_nvenc":
+            cbr = SETTINGS["RemuxBitrate"]
+            preset = SETTINGS["RemuxH264Preset"]
+            ffmpeg_cmd = ffmpeg.output(audio, video, output_path,
+                                       vcodec="h264_nvenc",
+                                       acodec="copy",
+                                       map="-map 0",
+                                       preset=preset,
+                                       video_bitrate=cbr * 1000)
+
+        elif v_encoder == "libsvtav1":
+            if SETTINGS["RemuxBitrateMode"] == "cq":
+                cq = SETTINGS["RemuxCRF"]
+                ffmpeg_cmd = ffmpeg.output(audio, video, output_path,
+                                           vcodec="libsvtav1",
+                                           acodec="copy",
+                                           map="-map 0",
+                                           crf=cq)
+
+        # elif v_encoder == "h264_amf":
+        #     cbr = int(SETTINGS["RemuxBitrate"]) * 1000
+    elif SETTINGS["RemuxMode"] == "custom_ffmpeg":
+        ffmpeg_cmd = SETTINGS["RemuxCustomFFmpeg"].replace("%INPUT%", input_path).replace("%OUTPUT%", stem)
+
+    return ffmpeg_cmd
+
+
+def run_ffmpeg_cmd(ffmpeg_cmds):
+    if not isinstance(ffmpeg_cmds, list):
+        ffmpeg_cmds = [ffmpeg_cmds]
+    for cmd in ffmpeg_cmds:
+        subprocess.run(cmd, shell=True)
+
+
+def run_ffmpeg_obj(ffmpeg_objects):
+    if not isinstance(ffmpeg_objects, list):
+        ffmpeg_objects = [ffmpeg_objects]
+    for obj in ffmpeg_objects:
+        obj.run()
 
 
 def manual_remux(props, prop, *args, **kwargs):
     if SETTINGS["ManualRemuxMode"] == "file":
         ffmpeg_input = SETTINGS["ManualRemuxInputFile"]
-        ffmpeg_cmd = generate_ffmpeg_cmd(ffmpeg_input)
-        remux_thread = threading.Thread(target=run_ffmpeg, args=(ffmpeg_cmd,), daemon=True)
-        remux_thread.start()
+        if SETTINGS["RemuxMode"] == "standard":
+            ffmpeg_obj = generate_ffmpeg_object(ffmpeg_input)
+            ffmpeg_obj.run(quiet=True)
+        elif SETTINGS["RemuxMode"] == "custom_ffmpeg":
+            filename_format = SETTINGS["RemuxFilenameFormat"]
+            stem = filename_format.replace("%FILE%", str(pathlib.Path(ffmpeg_input).stem))
+
+            output_dir = pathlib.Path(ffmpeg_input).parent
+            output_path = os.path.join(output_dir, stem)
+
+            ffmpeg_cmd = SETTINGS["RemuxCustomFFmpeg"].replace("%INPUT%", ffmpeg_input).replace("%OUTPUT%", output_path)
+
+            print(ffmpeg_cmd)
+            thread = threading.Thread(target=run_ffmpeg_cmd, args=(ffmpeg_cmd,))
+            thread.start()
+
     elif SETTINGS["ManualRemuxMode"] == "batch":
         input_folder = SETTINGS["ManualRemuxInputFolder"]
         file_formats = ["mp4", "mkv"]
         input_files = []
         for ff in file_formats:
             input_files += glob.glob(f"{input_folder}/*.{ff}")
-        remux_threads = []
-        for file in input_files:
-            ffmpeg_cmd = generate_ffmpeg_cmd(file)
-            thread = threading.Thread(target=run_ffmpeg, args=(ffmpeg_cmd,))
-            remux_threads.append(thread)
-        for thread in remux_threads:
+        if SETTINGS["RemuxMode"] == "standard":
+            ffmpeg_objects = []
+            for file in input_files:
+                ffmpeg_obj = generate_ffmpeg_object(file)
+                ffmpeg_objects.append(ffmpeg_obj)
+            thread = threading.Thread(target=run_ffmpeg_obj, args=(ffmpeg_objects,))
             thread.start()
+        if SETTINGS["RemuxMode"] == "custom_ffmpeg":
+            return
 
 
 def remux_properties(props):
     auto_remux_props = obs.obs_properties_create()
     replace_orig = obs.obs_properties_add_bool(auto_remux_props, "RemuxReplaceOriginal", "Overwrite original file")
-    remux_filename = obs.obs_properties_add_text(auto_remux_props, "RemuxFilenameFormat",
-                                                 "Remuxed filename format",
-                                                 type=obs.OBS_TEXT_DEFAULT)
+
+    remux_on_stop = obs.obs_properties_add_bool(auto_remux_props, "RemuxOnBufferStop",
+                                                "Remux replays after replay buffer is stopped (Experimental)")
     auto_remux_menu = obs.obs_properties_add_group(props, "RemuxReplays", "Automatically remux replays",
                                                    obs.OBS_GROUP_CHECKABLE, auto_remux_props)
 
     remux_props = obs.obs_properties_create()
-
+    remux_filename = obs.obs_properties_add_text(remux_props, "RemuxFilenameFormat",
+                                                 "Remuxed filename format",
+                                                 type=obs.OBS_TEXT_DEFAULT)
     remux_mode = obs.obs_properties_add_list(remux_props, "RemuxMode", "Mode",
                                              type=obs.OBS_COMBO_TYPE_LIST, format=obs.OBS_COMBO_FORMAT_STRING)
     obs.obs_property_list_add_string(remux_mode, "Standard", "standard")
@@ -414,7 +500,6 @@ def file_sort_properties(props):
     obs.obs_property_list_add_string(date_sort_scheme, "YYYY-MM-DD/", "%Y-%m-%d/")
     obs.obs_property_list_add_string(date_sort_scheme, "YYYY/Month/WKDY_DD/", "%Y/%B/%a_%d/")
 
-
     file_sort_by = obs.obs_properties_add_list(file_sorting_props, "ReplaySortType", "Categorize replays by",
                                                type=obs.OBS_COMBO_TYPE_LIST, format=obs.OBS_COMBO_FORMAT_STRING)
     obs.obs_property_set_modified_callback(file_sort_by, file_sorting_modified)
@@ -459,6 +544,12 @@ def script_properties():
                                                       "File path", obs.OBS_PATH_FILE_SAVE, "", "")
     persistant_file_menu = obs.obs_properties_add_group(props, "PersistentReplayFile", "Persistent replay file",
                                                         obs.OBS_GROUP_CHECKABLE, persistant_file_props)
+
+    concat_props = obs.obs_properties_create()
+    concat_menu = obs.obs_properties_add_group(props, "ConcatenateReplays", "Concatenate replay files",
+                                               obs.OBS_GROUP_CHECKABLE, concat_props)
+    # TODO: Decide whether to keep
+    obs.obs_property_set_enabled(concat_menu, False)
 
     props = file_sort_properties(props)
     props = remux_properties(props)
@@ -515,10 +606,12 @@ def find_exe_from_list():
     return None
 
 
-def generate_filename(prefix="", suffix="", file_ext=""):
+def generate_filename(prefix="", suffix="", file_ext="", timestamp=None):
     global SETTINGS
+    if timestamp is None:
+        timestamp = datetime.datetime.now()
     file_ext = file_ext.replace(".", "")
-    filename = datetime.datetime.now().strftime(SETTINGS["FilenameFormat"])
+    filename = timestamp.strftime(SETTINGS["FilenameFormat"])
     if prefix is not "":
         filename = f"{prefix}_{filename}"
     if suffix is not "":
@@ -551,6 +644,44 @@ def generate_dir(root_dir):
     return return_dir
 
 
+def save_replay(input_file, output_dir, timestamp=None, get_path_only=False):
+    global SETTINGS
+
+    if timestamp is None:
+        timestamp = datetime.datetime.now()
+
+    file_ext = pathlib.Path(input_file).suffix
+    filename = pathlib.Path(input_file)
+    if len(filename.name.split(".")[0]) == 0:  # Empty filename, e.g. ".mp4"
+        file_ext = filename.name.split(".")[1]
+    prefix = ""
+    if SETTINGS["ExeSortPrefixes"]:
+        active_exe = find_exe_from_list()
+        if active_exe is not None:
+            prefix = active_exe["prefix"]
+    new_filename = generate_filename(prefix=prefix, file_ext=file_ext, timestamp=timestamp)
+    save_dir = generate_dir(output_dir)
+    pathlib.Path(save_dir).mkdir(parents=True, exist_ok=True)
+    new_path = os.path.join(save_dir, new_filename)
+    # Generate unique filename by appending e.g. "_1"
+    if not SETTINGS["OverwriteExistingFile"]:
+        num = 1
+        while os.path.exists(new_path):
+            filename = pathlib.Path(new_path).stem
+            file_ext = pathlib.Path(new_path).suffix
+            test_filename = f"{filename}_{num}{file_ext}"
+            test_path = os.path.join(save_dir, test_filename)
+            if not os.path.exists(test_path):
+                new_path = test_path
+                break
+            num += 1
+
+    if not get_path_only:
+        shutil.move(input_file, new_path)
+
+    return new_path
+
+
 def on_event(event):
     global SETTINGS, CURRENT_BUFFER
 
@@ -563,37 +694,10 @@ def on_event(event):
         print("===== REPLAY BUFFER STARTED =====", f"\n{start_time}\n")
 
     elif event == obs.OBS_FRONTEND_EVENT_REPLAY_BUFFER_SAVED:
-        print("== Replay buffer saved")
         replay_path = get_latest_replay_path()
-        print("Original file:", replay_path)
-
-        file_ext = pathlib.Path(replay_path).suffix
-        filename = pathlib.Path(replay_path)
-        if len(filename.name.split(".")[0]) == 0:  # Empty filename, e.g. ".mp4"
-            file_ext = filename.name.split(".")[1]
-        prefix = ""
-        if SETTINGS["ExeSortPrefixes"]:
-            active_exe = find_exe_from_list()
-            if active_exe is not None:
-                prefix = active_exe["prefix"]
-        new_filename = generate_filename(prefix=prefix, file_ext=file_ext)
-        save_dir = generate_dir(SETTINGS["ReplayOutDir"])
-        pathlib.Path(save_dir).mkdir(parents=True, exist_ok=True)
-        new_path = os.path.join(save_dir, new_filename)
-        # Generate unique filename by appending e.g. "_1"
-        if not SETTINGS["OverwriteExistingFile"]:
-            num = 1
-            while os.path.exists(new_path):
-                filename = pathlib.Path(new_path).stem
-                file_ext = pathlib.Path(new_path).suffix
-                test_filename = f"{filename}_{num}{file_ext}"
-                test_path = os.path.join(save_dir, test_filename)
-                if not os.path.exists(test_path):
-                    new_path = test_path
-                    break
-                num += 1
-        shutil.move(replay_path, new_path)
-        print("New file path:", new_path)
+        print("== Replay buffer saved")
+        new_path = save_replay(replay_path, SETTINGS["ReplayOutDir"])
+        print("->", new_path)
         CURRENT_BUFFER["saved_replays"].append(new_path)
         if SETTINGS["PersistentReplayFilePath"] is not None:
             try:
@@ -601,14 +705,33 @@ def on_event(event):
             except shutil.SameFileError:
                 pass
 
-        if SETTINGS["RemuxReplays"]:
+        if SETTINGS["RemuxReplays"] and not SETTINGS["RemuxOnBufferStop"]:
             ffmpeg_input = new_path
-            ffmpeg_cmd = generate_ffmpeg_cmd(ffmpeg_input)
-            remux_thread = threading.Thread(target=run_ffmpeg, args=(ffmpeg_cmd,))
+            ffmpeg_obj = generate_ffmpeg_object(ffmpeg_input)
+            remux_thread = threading.Thread(target=run_ffmpeg_obj, args=(ffmpeg_obj,))
             remux_thread.start()
 
     elif event == obs.OBS_FRONTEND_EVENT_REPLAY_BUFFER_STOPPED:
         end_time = datetime.datetime.now()
-        print("\n===== REPLAY BUFFER STOPPED =====", f"\n{end_time}\nSaved replays:")
-        for f in CURRENT_BUFFER["saved_replays"]:
-            print(f)
+        print("\n===== REPLAY BUFFER STOPPED =====", f"\n{end_time}")
+        if SETTINGS["ConcatenateReplays"]:
+            print("Concatenating replays")
+            concat_str = ""
+            for file in CURRENT_BUFFER["saved_replays"]:
+                concat_str += f"file '{file}'\n"
+            with open("concat.txt", "w") as f:
+                f.write(concat_str)
+            input_file = CURRENT_BUFFER["saved_replays"][0]
+            input_path = pathlib.Path(input_file)
+            concat_path = save_replay(input_path, SETTINGS["ReplayOutDir"], timestamp=end_time, get_path_only=True)
+            ffmpeg_cmd = f"ffmpeg -f concat -safe 0 -i concat.txt -c copy {concat_path}"
+            remux_thread = threading.Thread(target=run_ffmpeg_obj, args=(ffmpeg_cmd,))
+            remux_thread.start()
+
+        if SETTINGS["RemuxReplays"] and SETTINGS["RemuxOnBufferStop"]:
+            print("Remuxing replays...")
+            ffmpeg_objects = []
+            for f in CURRENT_BUFFER["saved_replays"]:
+                ffmpeg_objects.append(generate_ffmpeg_object(f))
+            remux_thread = threading.Thread(target=run_ffmpeg_obj, args=(ffmpeg_objects,))
+            remux_thread.start()
