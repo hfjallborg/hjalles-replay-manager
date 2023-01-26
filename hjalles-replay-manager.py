@@ -11,12 +11,17 @@ import ffmpeg
 import obspython as obs
 import psutil
 
-__version__ = "1.2.0-alpha.2"
+__version__ = "1.2.0-alpha.3"
 
 CURRENT_BUFFER = {
     "start_time": None,
     "saved_replays": []
 }
+
+ENABLE_REMUX_PROPS = True
+ENABLE_BACKUP_PROPS = True
+
+SETTINGS = {}
 
 
 def script_description():
@@ -54,10 +59,10 @@ def script_load(settings):
     obs.obs_data_set_default_string(settings, "PersistentReplayFilePath", file_path)
 
     obs.obs_data_set_default_string(settings, "DatetimeSortScheme", "%Y-%m-%d/")
-    obs.obs_data_set_default_string(settings, "ExeSortList", ("bf4.exe, Battlefield 4, BF4\n"
-                                                              "TslGame.exe, PUBG, PUBG\n"
-                                                              "BF2042.exe, Battlefield 2042, BF2042\n"
-                                                              "bfv.exe, Battlefield V, BF5"))
+    obs.obs_data_set_default_string(settings, "ExeSortList", ("bf4.exe,Battlefield 4,BF4\n"
+                                                              "TslGame.exe,PUBG,PUBG\n"
+                                                              "BF2042.exe,Battlefield 2042,BF2042\n"
+                                                              "bfv.exe,Battlefield V,BF5"))
 
     obs.obs_data_set_default_bool(settings, "ConcatenateReplays", False)
 
@@ -104,6 +109,10 @@ def script_update(settings):
     SETTINGS["ManualRemuxMode"] = obs.obs_data_get_string(settings, "ManualRemuxMode")
     SETTINGS["ManualRemuxInputFile"] = obs.obs_data_get_string(settings, "ManualRemuxInputFile")
     SETTINGS["ManualRemuxInputFolder"] = obs.obs_data_get_string(settings, "ManualRemuxInputFolder")
+
+    SETTINGS["EnableBackup"] = obs.obs_data_get_bool(settings, "EnableBackup")
+    SETTINGS["BackupDir"] = obs.obs_data_get_string(settings, "BackupDir")
+    SETTINGS["BackupDeleteOriginal"] = obs.obs_data_get_bool(settings, "BackupDeleteOriginal")
 
     if obs.obs_data_get_bool(settings, "PersistentReplayFile"):
         SETTINGS["PersistentReplayFilePath"] = obs.obs_data_get_string(settings, "PersistentReplayFilePath")
@@ -516,6 +525,19 @@ def file_sort_properties(props):
     return props
 
 
+def backup_properties(props):
+    backup_props = obs.obs_properties_create()
+    obs.obs_properties_add_path(backup_props, "BackupDir", "Backup directory",
+                                obs.OBS_PATH_DIRECTORY, "", "")
+
+    obs.obs_properties_add_bool(backup_props, "BackupDeleteOriginal", "Move files (delete original)")
+
+    obs.obs_properties_add_group(props, "EnableBackup", "Backup replays", obs.OBS_GROUP_CHECKABLE,
+                                 backup_props)
+
+    return props
+
+
 def script_properties():
     props = obs.obs_properties_create()
 
@@ -552,7 +574,10 @@ def script_properties():
     obs.obs_property_set_enabled(concat_menu, False)
 
     props = file_sort_properties(props)
-    props = remux_properties(props)
+    if ENABLE_REMUX_PROPS:
+        props = remux_properties(props)
+    if ENABLE_BACKUP_PROPS:
+        props = backup_properties(props)
 
     obs.obs_properties_apply_settings(props, SCRIPT_PROPERTIES)
 
@@ -607,14 +632,27 @@ def find_exe_from_list():
 
 
 def generate_filename(prefix="", suffix="", file_ext="", timestamp=None):
+    """Generate a filename from current user config.
+
+    :param prefix: The prefix will be placed before the rest of the filename, separated with an underscore.
+    :type prefix: str
+    :param suffix: The suffix will be placed after the rest of the filename, separated with an underscore.
+    :type prefix: str
+    :param file_ext: Desired file extension, can be an empty string for no file extension.
+    :type file_ext: str
+    :param timestamp: A datetime object can be passed, otherwise it will default to datetime.now()
+    :type timestamp: datetime.DateTime
+    """
     global SETTINGS
     if timestamp is None:
         timestamp = datetime.datetime.now()
     file_ext = file_ext.replace(".", "")
     filename = timestamp.strftime(SETTINGS["FilenameFormat"])
     if prefix is not "":
+        prefix = prefix.strip()
         filename = f"{prefix}_{filename}"
     if suffix is not "":
+        suffix = suffix.strip()
         filename = f"{filename}_{suffix}"
     if file_ext is not "":
         filename = f"{filename}.{file_ext}"
@@ -632,12 +670,12 @@ def generate_dir(root_dir):
         elif SETTINGS["ReplaySortType"] == "_sort_by_exe":
             active_exe = find_exe_from_list()
             if active_exe is not None:
-                name = active_exe["name"]
+                name = active_exe["name"].strip()
                 return_dir = os.path.join(return_dir, name)
         if SETTINGS["SortByDate"]:
             if SETTINGS["DatetimeSortBase"] == "replay_buffer_start":
                 time = CURRENT_BUFFER["start_time"]
-            elif SETTINGS["DatetimeSortBase"] == "replay_buffer_saved":
+            else:
                 time = datetime.datetime.now()
             date_path = time.strftime(SETTINGS["DatetimeSortScheme"])
             return_dir = os.path.join(return_dir, date_path)
@@ -682,6 +720,30 @@ def save_replay(input_file, output_dir, timestamp=None, get_path_only=False):
     return new_path
 
 
+def backup_replay(src):
+
+    if not os.path.isdir(SETTINGS["BackupDir"]):
+        print(f"Backup directory does not exist or isn't connected.")
+        return
+
+    try:
+        os.listdir(pathlib.Path(SETTINGS["BackupDir"]))
+    except FileNotFoundError as e:
+        print(f"Backup directory does not exist or isn't connected ({e})")
+        return
+
+    parent_parts = pathlib.Path(src).parent.relative_to(SETTINGS["ReplayOutDir"]).parts
+    backup_parts = pathlib.Path(SETTINGS["BackupDir"]).parts + parent_parts
+    backup_dir = pathlib.Path("/".join(backup_parts))
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    if SETTINGS["BackupDeleteOriginal"]:
+        shutil.move(src, backup_dir)
+        print(f"    Moved to backup directory -> {backup_dir}")
+    else:
+        shutil.copy(src, backup_dir)
+        print(f"    Copied to backup directory -> {backup_dir}")
+
+
 def on_event(event):
     global SETTINGS, CURRENT_BUFFER
 
@@ -697,13 +759,17 @@ def on_event(event):
         replay_path = get_latest_replay_path()
         print("== Replay buffer saved")
         new_path = save_replay(replay_path, SETTINGS["ReplayOutDir"])
-        print("->", new_path)
+        print("    ->", new_path)
         CURRENT_BUFFER["saved_replays"].append(new_path)
         if SETTINGS["PersistentReplayFilePath"] is not None:
             try:
                 shutil.copyfile(new_path, SETTINGS["PersistentReplayFilePath"])
             except shutil.SameFileError:
                 pass
+
+        if SETTINGS["EnableBackup"]:
+            backup_thread = threading.Thread(target=backup_replay, args=(new_path,))
+            backup_thread.start()
 
         if SETTINGS["RemuxReplays"] and not SETTINGS["RemuxOnBufferStop"]:
             ffmpeg_input = new_path
