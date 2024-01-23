@@ -2,12 +2,13 @@ import datetime
 import os
 import pathlib
 import shutil
+import platform
 
 import obspython as obs
 
 import psutil
 
-__version__ = "1.0.2"
+__version__ = "1.1.0"
 
 
 def script_description():
@@ -34,8 +35,15 @@ def script_load(settings):
     obs.obs_data_set_default_string(settings, "FilenameFormat", "Replay_%Y-%m-%d_%H-%M-%S")
 
     # Read OBS config file in AppData dir
+    system = platform.system()
+    if system == "Windows":
+        appdata = os.getenv("APPDATA")
+    elif system == "Linux":
+        home = os.path.expanduser("~")
+        appdata = os.path.join(home, ".config")
+    else:
+        raise OSError(f"Platform not supported: {os}")
     profile_name = obs.obs_frontend_get_current_profile()
-    appdata = os.getenv("APPDATA")
     profile_dir = os.path.join(appdata, "obs-studio", "basic", "profiles", profile_name)
     # TODO: FIX PROPER INI READING
     with open(os.path.join(profile_dir, "basic.ini"), "r") as f:
@@ -153,9 +161,9 @@ def script_properties():
 
 
 def getListOfProcessSortedByMemory():
-    '''
+    """
     Get list of running process sorted by Memory Usage
-    '''
+    """
     listOfProcObjects = []
     # Iterate over the list
     for proc in psutil.process_iter():
